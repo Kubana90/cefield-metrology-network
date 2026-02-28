@@ -1,0 +1,8 @@
+fastapi==0.104.0
+uvicorn==0.23.2
+sqlalchemy==2.0.22
+psycopg2-binary==2.9.9
+pgvector==0.2.3
+pydantic==2.4.2
+anthropic==0.5.0
+stripe==7.5.0
