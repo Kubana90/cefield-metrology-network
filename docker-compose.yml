@@ -8,23 +8,22 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: cefield
     ports:
-      - "5432:5432"
+      # Using 5433 to avoid conflict with local PostgreSQL on Windows
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
   cloud-core:
-    build: 
+    build:
       context: ./cloud-core
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     depends_on:
       - db
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/cefield
-      # The Anthropic API key for AI Diagnostics
-      # You can pass this via your host machine's environment or a .env file
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      # Stripe API Keys for B2B SaaS Billing
       - STRIPE_API_KEY=${STRIPE_API_KEY:-sk_test_mock_123}
       - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-whsec_mock_123}
 
@@ -33,7 +32,6 @@ services:
       context: ./edge-node
     depends_on:
       - cloud-core
-    # The agent will run its script and simulate the Stanford/Munich physics match
     environment:
       - PYTHONUNBUFFERED=1
 
