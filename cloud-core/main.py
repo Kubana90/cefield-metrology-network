@@ -19,7 +19,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import engine, get_db, Base, Organization, Node, Measurement
+from database import engine, get_db, Base, Organization, Node, Measurement, init_db
 
 try:
     from anthropic import Anthropic
@@ -31,7 +31,8 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cefield")
 
-Base.metadata.create_all(bind=engine)
+# Initialize database AND pgvector extension
+init_db()
 
 app = FastAPI(
     title="CEFIELD Global Brain API - Enterprise",
