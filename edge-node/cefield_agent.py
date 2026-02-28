@@ -4,6 +4,7 @@ import httpx
 import numpy as np
 from scipy.signal import hilbert
 
+# Use the exact docker-compose service name for internal DNS resolution
 CLOUD_API_URL = "http://cloud-core:8000/api/v1/ingest"
 API_KEY = "cef_dev_machine_001"
 
@@ -49,7 +50,8 @@ def extract_signature_vector(signal):
 
 def main():
     print(f"[*] CEFIELD Swarm Simulation Agent started.")
-    time.sleep(5)
+    # Wait for the FastAPI server to fully boot up
+    time.sleep(10)
     
     headers = {
         "X-CEFIELD-API-KEY": API_KEY,
