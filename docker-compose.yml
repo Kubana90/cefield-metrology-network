@@ -7,6 +7,7 @@ services:
       - "8000:8000"
     environment:
       - POSTGRES_URL=postgresql://cefield:cefield@db:5432/genome
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     depends_on:
       - db
 
