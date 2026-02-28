@@ -1,15 +1,15 @@
 import os
-import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from database import engine, get_db, Base
 from models import Node, Measurement
@@ -23,8 +23,8 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="CEFIELD Global Brain API",
-    description="The central hub for the federated resonator measurement network.",
-    version="1.3.0"
+    description="Federated resonator network with AI Root Cause Analysis & pgvector Similarity Search.",
+    version="1.4.0"
 )
 
 # -----------------------------
@@ -33,10 +33,6 @@ app = FastAPI(
 API_KEY_HEADER = APIKeyHeader(name="X-CEFIELD-API-KEY", auto_error=True)
 
 def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
-    """
-    In production, this would check against an 'organizations' table.
-    For this MVP, we allow a hardcoded demo key or any key starting with 'cef_'.
-    """
     if api_key == "demo_key_123" or api_key.startswith("cef_"):
         return api_key
     raise HTTPException(status_code=403, detail="Could not validate credentials")
@@ -65,10 +61,45 @@ class ResonatorSignature(BaseModel):
     lon: Optional[float] = None
 
 
-def analyze_anomaly_with_claude(signature: ResonatorSignature) -> str:
-    """Calls Claude 3.5 Sonnet for physics-aware root cause analysis."""
+def find_similar_anomalies(db: Session, query_vector: list[float], limit: int = 3) -> List[Tuple[Measurement, float, str]]:
+    """
+    Uses pgvector L2 distance (<->) to find the most mathematically similar 
+    resonator signatures across the global database.
+    """
+    # Find similar vectors where q_factor was also low (historical anomalies)
+    # L2 distance: Measurement.signature_vector.l2_distance(query_vector)
+    # We join with Node to get the lab names
+    results = (
+        db.query(Measurement, Node.lab_name, Measurement.signature_vector.l2_distance(query_vector).label("distance"))
+        .join(Node)
+        .filter(Measurement.is_anomaly == True)
+        .order_by("distance")
+        .limit(limit)
+        .all()
+    )
+    
+    similar_cases = []
+    for meas, lab_name, dist in results:
+        # Convert distance to a rough similarity percentage (heuristic for demo)
+        similarity_score = max(0.0, 100.0 - (dist * 100.0)) 
+        similar_cases.append((meas, similarity_score, lab_name))
+        
+    return similar_cases
+
+
+def analyze_anomaly_with_claude(signature: ResonatorSignature, similar_cases: List[Tuple[Measurement, float, str]]) -> str:
+    """Calls Claude with current hardware data PLUS historical swarm intelligence."""
     if not anthropic_client:
         return "AI Diagnostic disabled. Missing ANTHROPIC_API_KEY."
+
+    # Build context from the global swarm
+    swarm_context = "Historical matches from the Global Resonator Genome:\n"
+    if not similar_cases:
+        swarm_context += "- No exact historical matches found yet. This is a novel anomaly pattern.\n"
+    else:
+        for meas, score, lab in similar_cases:
+            lab_display = lab or "Unknown Lab"
+            swarm_context += f"- MATCH: {score:.1f}% similarity to an anomaly recorded at {lab_display} (f0: {meas.f0}Hz, Q: {meas.q_factor}).\n"
 
     prompt = f"""
 You are the CEFIELD Root Cause Diagnostic AI.
@@ -78,7 +109,9 @@ A laboratory node reported an anomalous measurement:
 - Frequency (f0): {signature.f0} Hz
 - Q-Factor: {signature.q_factor} (Anomalous drop detected)
 
-Based on typical resonator physics, provide a highly professional, 2-sentence diagnostic assessment of what is likely causing this drop, and suggest one immediate hardware check.
+{swarm_context}
+
+Based on typical resonator physics and the historical swarm matches provided, provide a highly professional, 2-sentence diagnostic assessment of what is likely causing this drop. Make sure to reference the historical matches if they exist to demonstrate swarm intelligence. Suggest one immediate hardware check.
 """.strip()
 
     try:
@@ -100,14 +133,11 @@ Based on typical resonator physics, provide a highly professional, 2-sentence di
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    """Single-file admin console (map + live node list)."""
     html_path = Path(__file__).parent / "web" / "dashboard.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
-
 @app.get("/api/v1/nodes")
 async def list_nodes(db: Session = Depends(get_db)):
-    """Returns state of all registered edge nodes from PostgreSQL."""
     nodes = db.query(Node).order_by(Node.last_seen.desc()).all()
     return {
         "updated_at": utc_now().isoformat(),
@@ -132,11 +162,7 @@ async def ingest_signature(
     api_key: str = Depends(verify_api_key),
     db: Session = Depends(get_db)
 ):
-    """
-    Receives a compressed vector from an Authenticated Edge Node.
-    Stores the measurement in Postgres and updates Node status.
-    """
-    # 1. Upsert Node (Enrollment on first contact)
+    # 1. Upsert Node
     node = db.query(Node).filter(Node.node_id == signature.node_id).first()
     if not node:
         logger.info(f"Registering new node: {signature.node_id}")
@@ -146,17 +172,19 @@ async def ingest_signature(
     node.hardware_type = signature.hardware_type
     node.last_seen = utc_now()
     node.last_q_factor = signature.q_factor
-    
     is_alert = signature.q_factor < 10000
     node.last_alert = is_alert
 
-    # Only update static metadata if provided
     if signature.lab_name: node.lab_name = signature.lab_name
     if signature.lat is not None: node.lat = signature.lat
     if signature.lon is not None: node.lon = signature.lon
 
-    # 2. Store the actual measurement (Commit)
-    # Note: signature_vector is stored as pgvector embedding
+    # 2. Similarity Search BEFORE saving the new one (so we don't just match against ourselves)
+    similar_cases = []
+    if is_alert:
+        similar_cases = find_similar_anomalies(db, signature.signature_vector, limit=3)
+
+    # 3. Store the actual measurement
     measurement = Measurement(
         node_id=node.id,
         f0=signature.f0,
@@ -167,24 +195,17 @@ async def ingest_signature(
     db.add(measurement)
     db.commit()
 
-    # 3. AI Analysis if anomaly
+    # 4. AI Analysis with Swarm Context
     if is_alert:
-        diagnostic = analyze_anomaly_with_claude(signature)
-        # We could save the diagnostic back to the DB here
+        diagnostic = analyze_anomaly_with_claude(signature, similar_cases)
         return {
             "status": "ingested",
             "alert": "Q-Factor drop detected. Anomaly registered.",
+            "swarm_matches": [
+                {"similarity_score": round(score, 1), "matched_lab": lab} 
+                for _, score, lab in similar_cases
+            ],
             "ai_diagnostic": diagnostic,
         }
 
     return {"status": "ingested", "message": f"Measurement committed for {signature.node_id}."}
-
-@app.get("/api/v1/genome/stats")
-async def get_genome_stats(db: Session = Depends(get_db)):
-    node_count = db.query(Node).count()
-    measurement_count = db.query(Measurement).count()
-    return {
-        "total_signatures_worldwide": measurement_count,
-        "active_edge_nodes": node_count,
-        "status": "online"
-    }
