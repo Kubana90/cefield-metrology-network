@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CEFIELD Global Brain — Admin Console</title>
+  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #0f1b32;
+      --panel2: #101a2e;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --border: rgba(148,163,184,0.20);
+      --shadow: 0 10px 30px rgba(0,0,0,0.35);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1200px 800px at 15% 5%, rgba(59,130,246,0.18), transparent 60%),
+                  radial-gradient(1000px 700px at 85% 0%, rgba(139,92,246,0.14), transparent 65%),
+                  var(--bg);
+      color: var(--text);
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(11,18,32,0.65);
+      backdrop-filter: blur(10px);
+    }
+
+    .title {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+    }
+
+    .title h1 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0.2px;
+    }
+
+    .title span {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .kpis {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .kpi {
+      background: rgba(15,27,50,0.85);
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      border-radius: 12px;
+      min-width: 130px;
+      box-shadow: var(--shadow);
+    }
+
+    .kpi .label {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .kpi .value {
+      font-size: 18px;
+      margin-top: 3px;
+      font-weight: 650;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 14px;
+      padding: 14px;
+      height: calc(100vh - 68px);
+    }
+
+    .panel {
+      background: rgba(15,27,50,0.75);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 12px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(16,26,46,0.65);
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: 0.2px;
+    }
+
+    .panel-header .hint {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    #map {
+      height: calc(100% - 46px);
+      width: 100%;
+      background: #0b1220;
+    }
+
+    .right {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .controls {
+      padding: 10px 12px;
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr 1fr;
+      border-bottom: 1px solid var(--border);
+      background: rgba(16,26,46,0.35);
+    }
+
+    .controls input, .controls select {
+      background: rgba(11,18,32,0.65);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 10px;
+      color: var(--text);
+      outline: none;
+    }
+
+    .controls input::placeholder { color: rgba(148,163,184,0.75); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: rgba(16,26,46,0.92);
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      padding: 10px 10px;
+      color: rgba(226,232,240,0.92);
+      font-weight: 650;
+    }
+
+    tbody td {
+      padding: 10px 10px;
+      border-bottom: 1px solid rgba(148,163,184,0.16);
+      color: rgba(226,232,240,0.92);
+      vertical-align: top;
+    }
+
+    tbody tr:hover {
+      background: rgba(59,130,246,0.08);
+      cursor: pointer;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,0.22);
+      background: rgba(11,18,32,0.55);
+      color: rgba(226,232,240,0.96);
+      font-size: 11px;
+    }
+
+    .dot { width: 8px; height: 8px; border-radius: 99px; }
+    .ok { background: var(--ok); }
+    .warn { background: var(--warn); }
+    .bad { background: var(--bad); }
+
+    .foot {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 11px;
+      background: rgba(16,26,46,0.35);
+    }
+
+    @media (max-width: 1050px) {
+      .grid { grid-template-columns: 1fr; }
+      body { overflow: auto; height: auto; }
+      #map { height: 420px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <h1>CEFIELD Global Brain — Admin Console</h1>
+      <span id="sub">Live view of the decentralized metrology network</span>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="label">Active nodes</div><div class="value" id="kpiNodes">–</div></div>
+      <div class="kpi"><div class="label">Alerts (Q drop)</div><div class="value" id="kpiAlerts">–</div></div>
+      <div class="kpi"><div class="label">Updated</div><div class="value" id="kpiUpdated">–</div></div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="panel">
+      <div class="panel-header">
+        <h2>World Map</h2>
+        <div class="hint">Nodes with geo metadata (lat/lon)</div>
+      </div>
+      <div id="map"></div>
+    </section>
+
+    <section class="panel right">
+      <div class="panel-header">
+        <h2>Nodes</h2>
+        <div class="hint">Click row to zoom (if available)</div>
+      </div>
+
+      <div class="controls">
+        <input id="filter" placeholder="Filter by node id / lab / hardware" />
+        <select id="status">
+          <option value="all">All</option>
+          <option value="alert">Alert</option>
+          <option value="ok">OK</option>
+          <option value="noloc">No location</option>
+        </select>
+      </div>
+
+      <div style="overflow:auto; flex:1;">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Node</th>
+              <th>Hardware</th>
+              <th>Last Q</th>
+              <th>Last seen (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+
+      <div class="foot">
+        <div id="footLeft">Polling /api/v1/nodes every 2s</div>
+        <div id="footRight">/dashboard</div>
+      </div>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    const map = L.map('map', { zoomControl: true }).setView([20, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const markers = new Map();
+
+    function fmt(x) {
+      if (x === null || x === undefined) return '–';
+      if (typeof x === 'number') return x.toLocaleString(undefined, { maximumFractionDigits: 0 });
+      return String(x);
+    }
+
+    function statusPill(n) {
+      const hasLoc = (n.lat !== null && n.lat !== undefined && n.lon !== null && n.lon !== undefined);
+      if (!hasLoc) return `<span class="pill"><span class="dot warn"></span>No loc</span>`;
+      if (n.last_alert) return `<span class="pill"><span class="dot bad"></span>Alert</span>`;
+      return `<span class="pill"><span class="dot ok"></span>OK</span>`;
+    }
+
+    function matchesFilter(n, q) {
+      if (!q) return true;
+      const hay = `${n.node_id} ${n.lab_name || ''} ${n.hardware_type}`.toLowerCase();
+      return hay.includes(q.toLowerCase());
+    }
+
+    function matchesStatus(n, s) {
+      const hasLoc = (n.lat !== null && n.lat !== undefined && n.lon !== null && n.lon !== undefined);
+      if (s === 'all') return true;
+      if (s === 'alert') return !!n.last_alert;
+      if (s === 'ok') return !n.last_alert;
+      if (s === 'noloc') return !hasLoc;
+      return true;
+    }
+
+    function upsertMarker(n) {
+      const hasLoc = (n.lat !== null && n.lat !== undefined && n.lon !== null && n.lon !== undefined);
+      if (!hasLoc) {
+        if (markers.has(n.node_id)) {
+          map.removeLayer(markers.get(n.node_id));
+          markers.delete(n.node_id);
+        }
+        return;
+      }
+
+      const color = n.last_alert ? '#ef4444' : '#10b981';
+      const icon = L.divIcon({
+        className: 'custom-marker',
+        html: `<div style="width:12px;height:12px;border-radius:999px;background:${color};box-shadow:0 0 0 4px rgba(255,255,255,0.10);"></div>`,
+      });
+
+      const popup = `
+        <div style="min-width:220px;">
+          <div style="font-weight:700; margin-bottom:6px;">${n.lab_name || n.node_id}</div>
+          <div style="color:#334155; font-size:12px;">Node: ${n.node_id}</div>
+          <div style="color:#334155; font-size:12px;">HW: ${n.hardware_type}</div>
+          <div style="color:#334155; font-size:12px;">Last Q: ${fmt(n.last_q_factor)}</div>
+          <div style="color:#334155; font-size:12px;">Last seen: ${n.last_seen}</div>
+        </div>
+      `;
+
+      if (markers.has(n.node_id)) {
+        const m = markers.get(n.node_id);
+        m.setLatLng([n.lat, n.lon]);
+        m.setIcon(icon);
+        m.bindPopup(popup);
+      } else {
+        const m = L.marker([n.lat, n.lon], { icon }).addTo(map);
+        m.bindPopup(popup);
+        markers.set(n.node_id, m);
+      }
+    }
+
+    function zoomTo(n) {
+      const hasLoc = (n.lat !== null && n.lat !== undefined && n.lon !== null && n.lon !== undefined);
+      if (!hasLoc) return;
+      map.setView([n.lat, n.lon], 6, { animate: true });
+      const m = markers.get(n.node_id);
+      if (m) m.openPopup();
+    }
+
+    async function refresh() {
+      const res = await fetch('/api/v1/nodes');
+      const data = await res.json();
+
+      const q = document.getElementById('filter').value || '';
+      const s = document.getElementById('status').value || 'all';
+
+      const nodes = (data.nodes || []).filter(n => matchesFilter(n, q) && matchesStatus(n, s));
+
+      const total = (data.nodes || []).length;
+      const alerts = (data.nodes || []).filter(n => !!n.last_alert).length;
+
+      document.getElementById('kpiNodes').textContent = String(total);
+      document.getElementById('kpiAlerts').textContent = String(alerts);
+      document.getElementById('kpiUpdated').textContent = new Date().toISOString().slice(11, 19);
+
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = '';
+
+      for (const n of nodes) {
+        upsertMarker(n);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${statusPill(n)}</td>
+          <td><div style="font-weight:650;">${n.node_id}</div><div style="color:#94a3b8; font-size:11px;">${n.lab_name || ''}</div></td>
+          <td>${n.hardware_type}</td>
+          <td>${fmt(n.last_q_factor)}</td>
+          <td>${n.last_seen}</td>
+        `;
+        tr.addEventListener('click', () => zoomTo(n));
+        tbody.appendChild(tr);
+      }
+
+      // Cleanup markers for nodes that no longer match data
+      const seen = new Set((data.nodes || []).map(n => n.node_id));
+      for (const [nodeId, marker] of markers.entries()) {
+        if (!seen.has(nodeId)) {
+          map.removeLayer(marker);
+          markers.delete(nodeId);
+        }
+      }
+    }
+
+    document.getElementById('filter').addEventListener('input', () => refresh().catch(() => {}));
+    document.getElementById('status').addEventListener('change', () => refresh().catch(() => {}));
+
+    refresh().catch(() => {});
+    setInterval(() => refresh().catch(() => {}), 2000);
+  </script>
+</body>
+</html>
