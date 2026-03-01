@@ -1,35 +1,37 @@
-import os
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+import os
 import secrets
+from datetime import UTC, datetime, timezone
+from typing import Optional
 
 try:
     import stripe
+
     STRIPE_AVAILABLE = True
 except ImportError:
     stripe = None
     STRIPE_AVAILABLE = False
     logging.warning("[CEFIELD] stripe not found — billing disabled.")
 
-from fastapi import FastAPI, Depends, HTTPException, Security, Request, BackgroundTasks
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Security
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import engine, get_db, Base, Organization, Node, Measurement, NodeBaseline, init_db
 from baseline import (
+    CRITICAL_Q_FACTOR_DEFAULT,
     compute_node_baseline,
     predict_time_to_failure,
     update_cached_baseline,
-    CRITICAL_Q_FACTOR_DEFAULT,
 )
-from normalizer import normalize_vector, get_hardware_info, list_supported_hardware
+from database import Base, Measurement, Node, NodeBaseline, Organization, engine, get_db, init_db
+from normalizer import get_hardware_info, list_supported_hardware, normalize_vector
 from pattern_classifier import classify_precursor_patterns, get_network_precursor_stats
 
 try:
     import anthropic
+
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     anthropic = None
@@ -56,7 +58,7 @@ if STRIPE_AVAILABLE and stripe:
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 # ─── Auth ────────────────────────────────────────────────────────────────────────
@@ -93,9 +95,9 @@ class ResonatorSignature(BaseModel):
     f0: float
     q_factor: float
     signature_vector: list[float] = Field(..., min_length=128, max_length=128)
-    lab_name: Optional[str] = None
-    lat: Optional[float] = None
-    lon: Optional[float] = None
+    lab_name: str | None = None
+    lat: float | None = None
+    lon: float | None = None
 
 
 class CustomerCreate(BaseModel):
@@ -144,7 +146,7 @@ def find_precursor_patterns(
 async def analyze_with_predictive_claude(
     signature: ResonatorSignature,
     baseline: dict,
-    prediction: Optional[dict],
+    prediction: dict | None,
     precursor_matches: list[dict],
 ) -> dict:
     """
@@ -159,8 +161,7 @@ async def analyze_with_predictive_claude(
                 prediction.get("days_to_failure") if prediction else None
             ),
             "failure_mechanism": (
-                "[MOCK] Thermal drift in resonator cavity — "
-                "substrate contamination suspected."
+                "[MOCK] Thermal drift in resonator cavity — substrate contamination suspected."
             ),
             "recommended_action": "Schedule clean-room inspection within 14 days.",
             "confidence": "mock",
@@ -220,6 +221,7 @@ async def analyze_with_predictive_claude(
 
     try:
         import json
+
         response = await client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=400,
@@ -243,8 +245,7 @@ def _background_classify_precursors(node_db_id: int, measurement_id: int) -> Non
         n = classify_precursor_patterns(db, node_db_id, measurement_id)
         if n > 0:
             logger.info(
-                f"[CEFIELD] Retroactively labeled {n} precursor measurements "
-                f"for node {node_db_id}"
+                f"[CEFIELD] Retroactively labeled {n} precursor measurements for node {node_db_id}"
             )
     finally:
         db.close()
@@ -288,9 +289,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid webhook")
     data_object = event.get("data", {}).get("object", {})
     customer_id = data_object.get("customer")
-    org = db.query(Organization).filter(
-        Organization.stripe_customer_id == customer_id
-    ).first()
+    org = db.query(Organization).filter(Organization.stripe_customer_id == customer_id).first()
     if org:
         if event.get("type") == "invoice.payment_failed":
             org.subscription_active = False
@@ -309,12 +308,7 @@ async def ingest_signature(
     db: Session = Depends(get_db),
 ):
     # Stripe usage metering
-    if (
-        STRIPE_AVAILABLE
-        and stripe
-        and org.stripe_customer_id
-        and "mock" not in STRIPE_API_KEY
-    ):
+    if STRIPE_AVAILABLE and stripe and org.stripe_customer_id and "mock" not in STRIPE_API_KEY:
         try:
             stripe.billing.MeterEvent.create(
                 event_name="api_requests",
@@ -345,11 +339,7 @@ async def ingest_signature(
 
     # Statistical baseline (replaces hardcoded threshold)
     baseline = compute_node_baseline(db, node.id)
-    prediction = (
-        predict_time_to_failure(baseline)
-        if baseline.get("status") == "ok"
-        else None
-    )
+    prediction = predict_time_to_failure(baseline) if baseline.get("status") == "ok" else None
 
     # Anomaly decision: statistical z-score OR near-term drift prediction
     is_stat_anomaly = baseline.get("is_statistical_anomaly", False)
@@ -365,11 +355,7 @@ async def ingest_signature(
         is_alert = True
 
     # Precursor search in global network
-    precursor_matches = (
-        find_precursor_patterns(db, normalized_vector)
-        if is_alert
-        else []
-    )
+    precursor_matches = find_precursor_patterns(db, normalized_vector) if is_alert else []
 
     # Persist measurement
     measurement = Measurement(
@@ -390,9 +376,7 @@ async def ingest_signature(
     if baseline.get("status") == "ok":
         background_tasks.add_task(update_cached_baseline, db, node.id, baseline)
     if is_alert:
-        background_tasks.add_task(
-            _background_classify_precursors, node.id, measurement.id
-        )
+        background_tasks.add_task(_background_classify_precursors, node.id, measurement.id)
 
     if is_alert:
         ai_report = await analyze_with_predictive_claude(
@@ -448,9 +432,7 @@ async def get_node_health(
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
     baseline = compute_node_baseline(db, node.id)
-    prediction = (
-        predict_time_to_failure(baseline) if baseline.get("status") == "ok" else None
-    )
+    prediction = predict_time_to_failure(baseline) if baseline.get("status") == "ok" else None
 
     return {
         "node_id": node_id,
@@ -464,7 +446,7 @@ async def get_node_health(
     }
 
 
-def _compute_risk_level(prediction: Optional[dict], baseline: dict) -> str:
+def _compute_risk_level(prediction: dict | None, baseline: dict) -> str:
     if not prediction or prediction.get("status") != "degrading":
         z = abs(baseline.get("z_score_last", 0))
         return "medium" if z > 2.5 else "low"
@@ -496,9 +478,7 @@ async def get_network_stats(
         "total_active_nodes": total_nodes,
         "precursor_library": precursor_stats,
         "network_intelligence": (
-            "high"
-            if precursor_stats.get("precursor_72h", 0) > 100
-            else "growing"
+            "high" if precursor_stats.get("precursor_72h", 0) > 100 else "growing"
         ),
     }
 

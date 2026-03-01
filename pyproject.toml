@@ -24,8 +24,7 @@ indent-style = "space"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-verbose = true
-tb = "short"
+addopts = "-v --tb=short"
 
 [tool.coverage.run]
 source = ["cloud-core"]
