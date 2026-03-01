@@ -4,121 +4,253 @@ from datetime import datetime, timezone
 from typing import Optional
 import secrets
 
-# Graceful stripe import - server starts even if package is missing
 try:
     import stripe
     STRIPE_AVAILABLE = True
 except ImportError:
     stripe = None
     STRIPE_AVAILABLE = False
-    logging.warning("[CEFIELD] stripe package not found - billing disabled, server running in mock mode.")
+    logging.warning("[CEFIELD] stripe not found — billing disabled.")
 
-from fastapi import FastAPI, Depends, HTTPException, Security, Request
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import engine, get_db, Base, Organization, Node, Measurement, init_db
+from database import engine, get_db, Base, Organization, Node, Measurement, NodeBaseline, init_db
+from baseline import (
+    compute_node_baseline,
+    predict_time_to_failure,
+    update_cached_baseline,
+    CRITICAL_Q_FACTOR_DEFAULT,
+)
+from normalizer import normalize_vector, get_hardware_info, list_supported_hardware
+from pattern_classifier import classify_precursor_patterns, get_network_precursor_stats
 
 try:
-    from anthropic import Anthropic
+    import anthropic
     ANTHROPIC_AVAILABLE = True
 except ImportError:
-    Anthropic = None
+    anthropic = None
     ANTHROPIC_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cefield")
 
-# Initialize database AND pgvector extension
 init_db()
 
 app = FastAPI(
-    title="CEFIELD Global Brain API - Enterprise",
-    description="Federated resonator network with pgvector Similarity Search & Stripe B2B Billing.",
-    version="2.1.0"
+    title="CEFIELD Global Brain API",
+    description="Federated resonator network — Predictive metrology intelligence.",
+    version="3.0.0",
 )
 
-# Config & Keys
+# ─── Config ─────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) else None
-
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "sk_test_mock")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_mock")
+
 if STRIPE_AVAILABLE and stripe:
     stripe.api_key = STRIPE_API_KEY
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
-# Auth
+
+# ─── Auth ────────────────────────────────────────────────────────────────────────
 API_KEY_HEADER = APIKeyHeader(name="X-CEFIELD-API-KEY", auto_error=True)
 
-def get_organization_from_api_key(api_key: str = Security(API_KEY_HEADER), db: Session = Depends(get_db)) -> Organization:
+
+def get_organization_from_api_key(
+    api_key: str = Security(API_KEY_HEADER),
+    db: Session = Depends(get_db),
+) -> Organization:
     if api_key == "cef_dev_machine_001":
         org = db.query(Organization).filter(Organization.api_key == api_key).first()
         if not org:
-            org = Organization(name="Demo University", api_key=api_key, subscription_active=True, subscription_tier="enterprise")
+            org = Organization(
+                name="Demo University",
+                api_key=api_key,
+                subscription_active=True,
+                subscription_tier="enterprise",
+            )
             db.add(org)
             db.commit()
             db.refresh(org)
         return org
-
     org = db.query(Organization).filter(Organization.api_key == api_key).first()
     if not org:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return org
 
-# Pydantic Schemas
+
+# ─── Schemas ─────────────────────────────────────────────────────────────────────
 class ResonatorSignature(BaseModel):
     node_id: str
     hardware_type: str
     f0: float
     q_factor: float
-    signature_vector: list[float]
+    signature_vector: list[float] = Field(..., min_length=128, max_length=128)
     lab_name: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
+
 
 class CustomerCreate(BaseModel):
     org_name: str
     email: str
 
-# Core AI Logic
-def find_similar_anomalies(db: Session, query_vector: list[float], limit: int = 3):
+
+# ─── Precursor Search ────────────────────────────────────────────────────────────
+def find_precursor_patterns(
+    db: Session,
+    normalized_vector: list[float],
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Core differentiator: searches global pre-failure precursor patterns.
+    Input vector must already be hardware-normalized.
+    """
     results = (
-        db.query(Measurement, Node.lab_name, Measurement.signature_vector.l2_distance(query_vector).label("distance"))
+        db.query(
+            Measurement,
+            Node.lab_name,
+            Node.hardware_type,
+            Measurement.pattern_type,
+            Measurement.signature_vector.l2_distance(normalized_vector).label("distance"),
+        )
         .join(Node)
-        .filter(Measurement.is_anomaly == True)
+        .filter(Measurement.pattern_type.in_(["precursor_72h", "precursor_24h"]))
         .order_by("distance")
         .limit(limit)
         .all()
     )
-    return [(meas, max(0.0, 100.0 - (dist * 100.0)), lab_name) for meas, lab_name, dist in results]
+    return [
+        {
+            "measurement": meas,
+            "similarity_pct": round(max(0.0, 100.0 - (dist * 100.0)), 1),
+            "lab": lab or "Anonymous Lab",
+            "hardware": hw or "Unknown",
+            "precursor_type": ptype,
+            "hours_before_failure": 24 if ptype == "precursor_24h" else 72,
+        }
+        for meas, lab, hw, ptype, dist in results
+    ]
 
-def analyze_anomaly_with_claude(signature: ResonatorSignature, similar_cases: list) -> str:
-    if not anthropic_client:
-        return "[MOCK] TLS Two-Level System defect identified. Pattern matches a known substrate contamination signature - recommend clean-room inspection of the resonator cavity."
 
-    swarm_context = "".join(
-        [f"- MATCH: {score:.1f}% at {lab or 'Unknown'} (f0: {m.f0}Hz, Q: {m.q_factor}).\n" for m, score, lab in similar_cases]
-    ) if similar_cases else "No historical matches.\n"
+# ─── Async AI Diagnostic ──────────────────────────────────────────────────────────
+async def analyze_with_predictive_claude(
+    signature: ResonatorSignature,
+    baseline: dict,
+    prediction: Optional[dict],
+    precursor_matches: list[dict],
+) -> dict:
+    """
+    Async predictive diagnostics via Claude 3.5 Sonnet.
+    Returns structured JSON: risk_level, days_to_predicted_failure,
+    failure_mechanism, recommended_action.
+    """
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        return {
+            "risk_level": "medium",
+            "days_to_predicted_failure": (
+                prediction.get("days_to_failure") if prediction else None
+            ),
+            "failure_mechanism": (
+                "[MOCK] Thermal drift in resonator cavity — "
+                "substrate contamination suspected."
+            ),
+            "recommended_action": "Schedule clean-room inspection within 14 days.",
+            "confidence": "mock",
+        }
 
-    prompt = f"Node ID: {signature.node_id}\nQ-Factor: {signature.q_factor}\n\n{swarm_context}\nProvide a highly professional, 2-sentence root cause diagnostic."
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+    precursor_ctx = (
+        "\n".join(
+            [
+                f"  \u2022 {m['similarity_pct']}% match @ {m['lab']} "
+                f"({m['hardware']}) \u2192 device failed "
+                f"{m['hours_before_failure']}h after this pattern"
+                for m in precursor_matches
+            ]
+        )
+        if precursor_matches
+        else "  \u2022 No precursor matches in global network yet."
+    )
+
+    if prediction and prediction.get("status") == "degrading":
+        trend_ctx = (
+            f"Drift: {prediction['slope_per_day']:+.1f} Q-units/day. "
+            f"Predicted failure in {prediction['days_to_failure']} days "
+            f"(confidence: {prediction['confidence']})."
+        )
+    elif baseline.get("status") == "ok":
+        trend_ctx = (
+            f"Q-Factor stable. Z-score: {baseline.get('z_score_last', 0):.2f}\u03c3 "
+            f"from {baseline['n_samples']}-sample baseline."
+        )
+    else:
+        trend_ctx = "Insufficient history (warmup phase)."
+
+    system = (
+        "You are an expert metrology engineer specialising in RF resonators, "
+        "MEMS devices, superconducting qubits, and quantum hardware. "
+        "Provide PREDICTIVE diagnostics. "
+        "Output valid JSON with exactly: "
+        '{"risk_level": "low|medium|high|critical", '
+        '"days_to_predicted_failure": <number or null>, '
+        '"failure_mechanism": "<2-sentence physics explanation>", '
+        '"recommended_action": "<1 specific preventive action>"}'
+    )
+
+    user = (
+        f"CURRENT MEASUREMENT:\n"
+        f"  Node: {signature.node_id} | Hardware: {signature.hardware_type}\n"
+        f"  f\u2080: {signature.f0:.4e} Hz | Q-Factor: {signature.q_factor:,.0f}\n"
+        f"  Z-score vs baseline: {baseline.get('z_score_last', 'N/A')}\u03c3\n"
+        f"  Baseline mean Q: {baseline.get('mean_q', 'N/A'):,.0f}"
+        f" \u00b1 {baseline.get('std_q', 0):.0f}\n\n"
+        f"TEMPORAL TREND:\n  {trend_ctx}\n\n"
+        f"GLOBAL NETWORK \u2014 Pre-failure pattern matches:\n{precursor_ctx}\n\n"
+        f"Diagnose failure risk and provide ONE preventive action."
+    )
 
     try:
-        response = anthropic_client.messages.create(
+        import json
+        response = await client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=250,
-            system="You are an expert physicist.",
-            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            system=system,
+            messages=[{"role": "user", "content": user}],
         )
-        return response.content[0].text
+        raw = response.content[0].text
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"failure_mechanism": raw, "confidence": "parse_error"}
     except Exception as e:
-        return f"AI Diagnostic failed: {e}"
+        logger.error(f"Claude API error: {e}")
+        return {"failure_mechanism": f"AI diagnostic unavailable: {e}", "confidence": "failed"}
 
-# Stripe Billing
+
+# ─── Background Tasks ─────────────────────────────────────────────────────────────
+def _background_classify_precursors(node_db_id: int, measurement_id: int) -> None:
+    db = next(get_db())
+    try:
+        n = classify_precursor_patterns(db, node_db_id, measurement_id)
+        if n > 0:
+            logger.info(
+                f"[CEFIELD] Retroactively labeled {n} precursor measurements "
+                f"for node {node_db_id}"
+            )
+    finally:
+        db.close()
+
+
+# ─── Billing Endpoints ────────────────────────────────────────────────────────────
 @app.post("/api/v1/billing/onboard")
 async def onboard_customer(data: CustomerCreate, db: Session = Depends(get_db)):
     try:
@@ -139,85 +271,258 @@ async def onboard_customer(data: CustomerCreate, db: Session = Depends(get_db)):
         )
         db.add(org)
         db.commit()
-        return {"message": "Organization created.", "api_key": new_api_key, "stripe_customer_id": stripe_customer_id}
+        return {"message": "Organization created.", "api_key": new_api_key}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/webhooks/stripe")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     if not STRIPE_AVAILABLE:
         return JSONResponse({"status": "stripe_not_available"})
-
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid webhook")
-
     data_object = event.get("data", {}).get("object", {})
     customer_id = data_object.get("customer")
-    org = db.query(Organization).filter(Organization.stripe_customer_id == customer_id).first()
-
+    org = db.query(Organization).filter(
+        Organization.stripe_customer_id == customer_id
+    ).first()
     if org:
         if event.get("type") == "invoice.payment_failed":
             org.subscription_active = False
         elif event.get("type") == "invoice.payment_succeeded":
             org.subscription_active = True
         db.commit()
-
     return JSONResponse({"status": "success"})
 
-# Data Ingest
+
+# ─── Core Ingest Endpoint ─────────────────────────────────────────────────────────
 @app.post("/api/v1/ingest")
 async def ingest_signature(
     signature: ResonatorSignature,
+    background_tasks: BackgroundTasks,
     org: Organization = Depends(get_organization_from_api_key),
     db: Session = Depends(get_db),
 ):
-    if STRIPE_AVAILABLE and stripe and org.stripe_customer_id and "mock" not in STRIPE_API_KEY:
+    # Stripe usage metering
+    if (
+        STRIPE_AVAILABLE
+        and stripe
+        and org.stripe_customer_id
+        and "mock" not in STRIPE_API_KEY
+    ):
         try:
             stripe.billing.MeterEvent.create(
                 event_name="api_requests",
                 payload={"value": "1", "stripe_customer_id": org.stripe_customer_id},
             )
         except Exception as e:
-            logger.error(f"Stripe Metering failed: {e}")
+            logger.error(f"Stripe metering failed: {e}")
 
+    # Normalize vector for cross-hardware comparability
+    normalized_vector = normalize_vector(signature.signature_vector, signature.hardware_type)
+
+    # Upsert Node
     node = db.query(Node).filter(Node.node_id == signature.node_id).first()
     if not node:
         node = Node(node_id=signature.node_id, org_id=org.id)
         db.add(node)
+        db.flush()
 
     node.hardware_type = signature.hardware_type
     node.last_seen = utc_now()
     node.last_q_factor = signature.q_factor
-    is_alert = signature.q_factor < 10000
-    node.last_alert = is_alert
+    if signature.lab_name:
+        node.lab_name = signature.lab_name
+    if signature.lat:
+        node.lat = signature.lat
+    if signature.lon:
+        node.lon = signature.lon
 
-    similar_cases = find_similar_anomalies(db, signature.signature_vector, 3) if is_alert else []
+    # Statistical baseline (replaces hardcoded threshold)
+    baseline = compute_node_baseline(db, node.id)
+    prediction = (
+        predict_time_to_failure(baseline)
+        if baseline.get("status") == "ok"
+        else None
+    )
 
+    # Anomaly decision: statistical z-score OR near-term drift prediction
+    is_stat_anomaly = baseline.get("is_statistical_anomaly", False)
+    is_drift_critical = (
+        prediction is not None
+        and prediction.get("status") == "degrading"
+        and prediction.get("days_to_failure", 999) < 30
+    )
+    is_alert = is_stat_anomaly or is_drift_critical
+
+    # Warmup fallback: conservative threshold until baseline matures
+    if baseline.get("needs_warmup") and signature.q_factor < CRITICAL_Q_FACTOR_DEFAULT:
+        is_alert = True
+
+    # Precursor search in global network
+    precursor_matches = (
+        find_precursor_patterns(db, normalized_vector)
+        if is_alert
+        else []
+    )
+
+    # Persist measurement
     measurement = Measurement(
         node_id=node.id,
         f0=signature.f0,
         q_factor=signature.q_factor,
-        signature_vector=signature.signature_vector,
+        signature_vector=normalized_vector,
         is_anomaly=is_alert,
+        timestamp=utc_now(),
+        pattern_type="failure" if is_alert else "normal",
     )
     db.add(measurement)
+    node.last_alert = is_alert
     db.commit()
+    db.refresh(measurement)
+
+    # Background: update cached baseline + retroactive precursor labeling
+    if baseline.get("status") == "ok":
+        background_tasks.add_task(update_cached_baseline, db, node.id, baseline)
+    if is_alert:
+        background_tasks.add_task(
+            _background_classify_precursors, node.id, measurement.id
+        )
 
     if is_alert:
+        ai_report = await analyze_with_predictive_claude(
+            signature, baseline, prediction, precursor_matches
+        )
         return {
-            "status": "ingested",
-            "alert": "Q-Factor drop detected. Anomaly registered.",
-            "swarm_matches": [{"similarity_score": round(s, 1), "matched_lab": l} for _, s, l in similar_cases],
-            "ai_diagnostic": analyze_anomaly_with_claude(signature, similar_cases),
+            "status": "alert",
+            "node_id": signature.node_id,
+            "alert": {
+                "type": "statistical" if is_stat_anomaly else "drift_prediction",
+                "z_score": round(baseline.get("z_score_last", 0.0), 2),
+                "days_to_predicted_failure": (
+                    prediction.get("days_to_failure") if prediction else None
+                ),
+                "drift_slope_per_day": round(baseline.get("slope_per_day", 0.0), 2),
+            },
+            "swarm_matches": [
+                {
+                    "similarity_pct": m["similarity_pct"],
+                    "lab": m["lab"],
+                    "hardware": m["hardware"],
+                    "hours_before_their_failure": m["hours_before_failure"],
+                }
+                for m in precursor_matches
+            ],
+            "ai_diagnostic": ai_report,
         }
 
-    return {"status": "ingested", "message": "Measurement committed."}
+    return {
+        "status": "ingested",
+        "node_id": signature.node_id,
+        "baseline": {
+            "mean_q": round(baseline.get("mean_q", 0), 1),
+            "z_score": round(baseline.get("z_score_last", 0.0), 2),
+            "n_samples": baseline.get("n_samples", 0),
+            "slope_per_day": round(baseline.get("slope_per_day", 0.0), 2),
+        }
+        if baseline.get("status") == "ok"
+        else {"status": "warmup", "n_samples": baseline.get("n_samples", 0)},
+    }
 
+
+# ─── Predictive Health Endpoint ───────────────────────────────────────────────────
+@app.get("/api/v1/nodes/{node_id}/health")
+async def get_node_health(
+    node_id: str,
+    org: Organization = Depends(get_organization_from_api_key),
+    db: Session = Depends(get_db),
+):
+    """Returns current health status and failure prediction for a specific node."""
+    node = db.query(Node).filter(Node.node_id == node_id).first()
+    if not node:
+        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+    baseline = compute_node_baseline(db, node.id)
+    prediction = (
+        predict_time_to_failure(baseline) if baseline.get("status") == "ok" else None
+    )
+
+    return {
+        "node_id": node_id,
+        "hardware_type": node.hardware_type,
+        "lab_name": node.lab_name,
+        "last_seen": node.last_seen.isoformat() if node.last_seen else None,
+        "current_q_factor": node.last_q_factor,
+        "baseline": baseline,
+        "prediction": prediction,
+        "risk_level": _compute_risk_level(prediction, baseline),
+    }
+
+
+def _compute_risk_level(prediction: Optional[dict], baseline: dict) -> str:
+    if not prediction or prediction.get("status") != "degrading":
+        z = abs(baseline.get("z_score_last", 0))
+        return "medium" if z > 2.5 else "low"
+    days = prediction.get("days_to_failure", 999)
+    if days <= 3:
+        return "critical"
+    if days <= 7:
+        return "high"
+    if days <= 30:
+        return "medium"
+    return "low"
+
+
+# ─── Network Intelligence Endpoints ──────────────────────────────────────────────
+@app.get("/api/v1/network/stats")
+async def get_network_stats(
+    org: Organization = Depends(get_organization_from_api_key),
+    db: Session = Depends(get_db),
+):
+    """Global network statistics — the competitive moat made visible."""
+    from sqlalchemy import func
+
+    total_measurements = db.query(func.count(Measurement.id)).scalar()
+    total_nodes = db.query(func.count(Node.id)).scalar()
+    precursor_stats = get_network_precursor_stats(db)
+
+    return {
+        "total_measurements": total_measurements,
+        "total_active_nodes": total_nodes,
+        "precursor_library": precursor_stats,
+        "network_intelligence": (
+            "high"
+            if precursor_stats.get("precursor_72h", 0) > 100
+            else "growing"
+        ),
+    }
+
+
+@app.get("/api/v1/hardware/supported")
+async def list_hardware(org: Organization = Depends(get_organization_from_api_key)):
+    """Returns all hardware types with built-in normalization profiles."""
+    return {"supported_hardware": list_supported_hardware()}
+
+
+# ─── System Health ────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "stripe": STRIPE_AVAILABLE, "ai": ANTHROPIC_AVAILABLE}
+    return {
+        "status": "ok",
+        "version": "3.0.0",
+        "stripe": STRIPE_AVAILABLE,
+        "ai": ANTHROPIC_AVAILABLE,
+        "features": [
+            "statistical_baseline_engine",
+            "predictive_time_to_failure",
+            "cross_hardware_normalization",
+            "precursor_pattern_library",
+            "async_claude_diagnostics",
+            "hnsw_vector_index",
+        ],
+    }

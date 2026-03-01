@@ -6,3 +6,8 @@ pgvector==0.2.3
 pydantic==2.4.2
 anthropic>=0.5.0
 stripe>=7.5.0
+numpy>=1.24.0
+scipy>=1.11.0
+httpx>=0.25.0
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
