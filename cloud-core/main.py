@@ -12,13 +12,16 @@ except ImportError:
     STRIPE_AVAILABLE = False
     logging.warning("[CEFIELD] stripe not found — billing disabled.")
 
-from fastapi import FastAPI, Depends, HTTPException, Security, Request, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, Security, Request, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import engine, get_db, Base, Organization, Node, Measurement, NodeBaseline, init_db
+from database import (
+    engine, get_db, Base, Organization, Node,
+    Measurement, NodeBaseline, CreditTransaction, init_db,
+)
 from baseline import (
     compute_node_baseline,
     predict_time_to_failure,
@@ -27,6 +30,14 @@ from baseline import (
 )
 from normalizer import normalize_vector, get_hardware_info, list_supported_hardware
 from pattern_classifier import classify_precursor_patterns, get_network_precursor_stats
+from credits import (
+    CreditAction,
+    apply_credit,
+    check_sufficient_credits,
+    get_credit_balance,
+    get_credit_history,
+    get_network_credit_stats,
+)
 
 try:
     import anthropic
@@ -42,8 +53,11 @@ init_db()
 
 app = FastAPI(
     title="CEFIELD Global Brain API",
-    description="Federated resonator network — Predictive metrology intelligence.",
-    version="3.0.0",
+    description=(
+        "Federated resonator network — Predictive metrology intelligence.\n\n"
+        "v3.1: Credit-based Metrologie-Intelligence Marketplace + SCPI Hardware Integration."
+    ),
+    version="3.1.0",
 )
 
 # ─── Config ─────────────────────────────────────────────────────────────────────
@@ -75,6 +89,7 @@ def get_organization_from_api_key(
                 api_key=api_key,
                 subscription_active=True,
                 subscription_tier="enterprise",
+                credit_balance=100,
             )
             db.add(org)
             db.commit()
@@ -101,6 +116,11 @@ class ResonatorSignature(BaseModel):
 class CustomerCreate(BaseModel):
     org_name: str
     email: str
+
+
+class CreditGrantRequest(BaseModel):
+    amount: int = Field(..., gt=0, description="Credits to grant")
+    note: Optional[str] = None
 
 
 # ─── Precursor Search ────────────────────────────────────────────────────────────
@@ -237,7 +257,7 @@ async def analyze_with_predictive_claude(
 
 
 # ─── Background Tasks ─────────────────────────────────────────────────────────────
-def _background_classify_precursors(node_db_id: int, measurement_id: int) -> None:
+def _background_classify_precursors(node_db_id: int, measurement_id: int, org_id: int) -> None:
     db = next(get_db())
     try:
         n = classify_precursor_patterns(db, node_db_id, measurement_id)
@@ -246,8 +266,80 @@ def _background_classify_precursors(node_db_id: int, measurement_id: int) -> Non
                 f"[CEFIELD] Retroactively labeled {n} precursor measurements "
                 f"for node {node_db_id}"
             )
+            # Reward: +25 credits per precursor batch generated
+            org = db.query(Organization).filter(Organization.id == org_id).first()
+            if org:
+                apply_credit(
+                    db, org, CreditAction.PRECURSOR_GENERATED,
+                    reference_id=f"measurement:{measurement_id}",
+                    note=f"Retroactive: {n} precursor patterns labeled",
+                )
+                db.commit()
     finally:
         db.close()
+
+
+# ─── Credit Endpoints ─────────────────────────────────────────────────────────────
+@app.get("/api/v1/credits/balance")
+async def credits_balance(
+    org: Organization = Depends(get_organization_from_api_key),
+):
+    """Returns current credit balance and spending power."""
+    return get_credit_balance(org)
+
+
+@app.get("/api/v1/credits/history")
+async def credits_history(
+    limit: int = Query(50, ge=1, le=200),
+    org: Organization = Depends(get_organization_from_api_key),
+    db: Session = Depends(get_db),
+):
+    """Returns credit transaction history for auditing."""
+    return {
+        "org_name": org.name,
+        "current_balance": org.credit_balance,
+        "transactions": get_credit_history(db, org, limit=limit),
+    }
+
+
+@app.post("/api/v1/credits/admin/grant")
+async def admin_grant_credits(
+    data: CreditGrantRequest,
+    org: Organization = Depends(get_organization_from_api_key),
+    db: Session = Depends(get_db),
+):
+    """
+    Admin endpoint: manually grant credits to an organization.
+    Use for promotions, partnerships, or error corrections.
+    """
+    tx = apply_credit(
+        db, org, CreditAction.ADMIN_GRANT,
+        amount_override=data.amount,
+        note=data.note or "Admin manual grant",
+    )
+    db.commit()
+    return {
+        "message": f"Granted {data.amount} credits to {org.name}",
+        "new_balance": org.credit_balance,
+        "transaction_id": tx.id,
+    }
+
+
+@app.get("/api/v1/credits/pricing")
+async def credits_pricing():
+    """Returns the current credit reward/cost table."""
+    from credits import CREDIT_REWARDS
+    return {
+        "pricing": {
+            action.value: amount
+            for action, amount in CREDIT_REWARDS.items()
+        },
+        "note": (
+            "Positive values = credits earned. "
+            "Negative values = credits consumed. "
+            "Enterprise tier has unlimited AI diagnostics."
+        ),
+    }
 
 
 # ─── Billing Endpoints ────────────────────────────────────────────────────────────
@@ -267,11 +359,24 @@ async def onboard_customer(data: CustomerCreate, db: Session = Depends(get_db)):
             stripe_customer_id=stripe_customer_id,
             subscription_active=True,
             subscription_tier="enterprise",
+            credit_balance=0,
             created_at=utc_now(),
         )
         db.add(org)
+        db.flush()
+
+        # Grant signup bonus via credit system
+        apply_credit(
+            db, org, CreditAction.SIGNUP_BONUS,
+            note="Welcome to the CEFIELD network!",
+        )
         db.commit()
-        return {"message": "Organization created.", "api_key": new_api_key}
+
+        return {
+            "message": "Organization created.",
+            "api_key": new_api_key,
+            "credit_balance": org.credit_balance,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -364,12 +469,23 @@ async def ingest_signature(
     if baseline.get("needs_warmup") and signature.q_factor < CRITICAL_Q_FACTOR_DEFAULT:
         is_alert = True
 
-    # Precursor search in global network
-    precursor_matches = (
-        find_precursor_patterns(db, normalized_vector)
-        if is_alert
-        else []
-    )
+    # ── Credit: precursor search costs credits (skip for enterprise) ────────────
+    precursor_matches = []
+    if is_alert:
+        can_query, balance = check_sufficient_credits(org, CreditAction.QUERY_PRECURSOR)
+        if can_query or org.subscription_tier == "enterprise":
+            precursor_matches = find_precursor_patterns(db, normalized_vector)
+            if precursor_matches:
+                apply_credit(
+                    db, org, CreditAction.QUERY_PRECURSOR,
+                    reference_id=f"node:{signature.node_id}",
+                    note=f"Precursor search: {len(precursor_matches)} matches",
+                )
+        else:
+            logger.warning(
+                f"[CREDIT] {org.name} has insufficient credits ({balance}) "
+                f"for precursor search — skipping"
+            )
 
     # Persist measurement
     measurement = Measurement(
@@ -383,6 +499,14 @@ async def ingest_signature(
     )
     db.add(measurement)
     node.last_alert = is_alert
+
+    # ── Credit: reward for ingestion ─────────────────────────────────────────────
+    credit_action = CreditAction.INGEST_ANOMALY if is_alert else CreditAction.INGEST_NORMAL
+    apply_credit(
+        db, org, credit_action,
+        reference_id=f"node:{signature.node_id}",
+    )
+
     db.commit()
     db.refresh(measurement)
 
@@ -391,13 +515,32 @@ async def ingest_signature(
         background_tasks.add_task(update_cached_baseline, db, node.id, baseline)
     if is_alert:
         background_tasks.add_task(
-            _background_classify_precursors, node.id, measurement.id
+            _background_classify_precursors, node.id, measurement.id, org.id
         )
 
     if is_alert:
-        ai_report = await analyze_with_predictive_claude(
-            signature, baseline, prediction, precursor_matches
-        )
+        # ── Credit: AI diagnostic costs credits (enterprise unlimited) ───────────
+        ai_report = None
+        can_ai, _ = check_sufficient_credits(org, CreditAction.AI_DIAGNOSTIC)
+        if can_ai or org.subscription_tier == "enterprise":
+            ai_report = await analyze_with_predictive_claude(
+                signature, baseline, prediction, precursor_matches
+            )
+            if org.subscription_tier != "enterprise":
+                apply_credit(
+                    db, org, CreditAction.AI_DIAGNOSTIC,
+                    reference_id=f"node:{signature.node_id}",
+                    note="Claude predictive diagnostic",
+                )
+                db.commit()
+        else:
+            ai_report = {
+                "risk_level": "unknown",
+                "failure_mechanism": "Insufficient credits for AI diagnostic.",
+                "recommended_action": "Top up credits or upgrade to enterprise tier.",
+                "confidence": "credit_limited",
+            }
+
         return {
             "status": "alert",
             "node_id": signature.node_id,
@@ -419,6 +562,7 @@ async def ingest_signature(
                 for m in precursor_matches
             ],
             "ai_diagnostic": ai_report,
+            "credits": get_credit_balance(org),
         }
 
     return {
@@ -432,6 +576,7 @@ async def ingest_signature(
         }
         if baseline.get("status") == "ok"
         else {"status": "warmup", "n_samples": baseline.get("n_samples", 0)},
+        "credits": get_credit_balance(org),
     }
 
 
@@ -490,6 +635,7 @@ async def get_network_stats(
     total_measurements = db.query(func.count(Measurement.id)).scalar()
     total_nodes = db.query(func.count(Node.id)).scalar()
     precursor_stats = get_network_precursor_stats(db)
+    credit_stats = get_network_credit_stats(db)
 
     return {
         "total_measurements": total_measurements,
@@ -500,6 +646,7 @@ async def get_network_stats(
             if precursor_stats.get("precursor_72h", 0) > 100
             else "growing"
         ),
+        "marketplace": credit_stats,
     }
 
 
@@ -514,7 +661,7 @@ async def list_hardware(org: Organization = Depends(get_organization_from_api_ke
 def health():
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "stripe": STRIPE_AVAILABLE,
         "ai": ANTHROPIC_AVAILABLE,
         "features": [
@@ -524,5 +671,7 @@ def health():
             "precursor_pattern_library",
             "async_claude_diagnostics",
             "hnsw_vector_index",
+            "credit_marketplace",
+            "scpi_hardware_bridge",
         ],
     }

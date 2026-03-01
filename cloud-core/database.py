@@ -25,6 +25,7 @@ class Organization(Base):
     """
     A paying B2B customer (e.g., Munich Quantum Lab, Bosch MEMS).
     Links API key to Stripe Customer ID for billing.
+    credit_balance tracks the organization's Metrologie-Intelligence credits.
     """
     __tablename__ = "organizations"
 
@@ -34,6 +35,7 @@ class Organization(Base):
     stripe_customer_id = Column(String, unique=True, nullable=True)
     subscription_active = Column(Boolean, default=False)
     subscription_tier = Column(String, default="freemium")  # 'freemium' | 'enterprise'
+    credit_balance = Column(Integer, default=100, nullable=False)  # Signup bonus: 100
     created_at = Column(DateTime, nullable=True)
 
 
@@ -91,6 +93,23 @@ class NodeBaseline(Base):
     updated_at = Column(DateTime, nullable=True)
 
 
+class CreditTransaction(Base):
+    """
+    Immutable ledger of all credit movements.
+    Every credit/debit creates a row — full auditability.
+    """
+    __tablename__ = "credit_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    org_id = Column(Integer, ForeignKey("organizations.id"), index=True, nullable=False)
+    action = Column(String(40), nullable=False)       # CreditAction enum value
+    amount = Column(Integer, nullable=False)           # Positive = earn, Negative = spend
+    balance_after = Column(Integer, nullable=False)    # Running balance after this tx
+    reference_id = Column(String, nullable=True)       # Link to measurement/node ID
+    note = Column(String, nullable=True)               # Human-readable context
+    created_at = Column(DateTime, nullable=False)
+
+
 def _create_indexes():
     """Create HNSW index for fast O(log n) pgvector similarity search."""
     with engine.connect() as conn:
@@ -107,6 +126,11 @@ def _create_indexes():
             USING hnsw (signature_vector vector_l2_ops)
             WITH (m = 32, ef_construction = 128)
             WHERE pattern_type IN ('precursor_72h', 'precursor_24h')
+        """))
+        # Credit transaction index for fast org lookups
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS credit_tx_org_created_idx
+            ON credit_transactions (org_id, created_at DESC)
         """))
         conn.commit()
 
