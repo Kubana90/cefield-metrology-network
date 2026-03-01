@@ -10,9 +10,10 @@ baseline modelling per node:
 
 This is the core algorithmic differentiator vs. all open-source tools.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -20,8 +21,8 @@ from sqlalchemy.orm import Session
 
 from database import Measurement, NodeBaseline
 
-BASELINE_WINDOW: int = 100          # Max recent measurements for baseline
-MIN_SAMPLES: int = 10               # Minimum samples before baseline is valid
+BASELINE_WINDOW: int = 100  # Max recent measurements for baseline
+MIN_SAMPLES: int = 10  # Minimum samples before baseline is valid
 Z_SCORE_ALERT_THRESHOLD: float = 2.5
 CRITICAL_Q_FACTOR_DEFAULT: float = 5_000.0  # Conservative hardware-agnostic fallback
 
@@ -54,12 +55,7 @@ def compute_node_baseline(db: Session, node_id: int, window: int = BASELINE_WIND
 
     values = np.array([r.q_factor for r in recent], dtype=np.float64)
     timestamps = np.array(
-        [
-            r.timestamp.timestamp()
-            if r.timestamp
-            else datetime.now(timezone.utc).timestamp()
-            for r in recent
-        ],
+        [r.timestamp.timestamp() if r.timestamp else datetime.now(UTC).timestamp() for r in recent],
         dtype=np.float64,
     )
 
@@ -93,7 +89,7 @@ def compute_node_baseline(db: Session, node_id: int, window: int = BASELINE_WIND
 def predict_time_to_failure(
     baseline: dict,
     critical_threshold: float = CRITICAL_Q_FACTOR_DEFAULT,
-) -> Optional[dict]:
+) -> dict | None:
     """
     Given a computed baseline with slope_per_day, estimate when
     the Q-factor will cross the critical threshold.
@@ -137,5 +133,5 @@ def update_cached_baseline(db: Session, node_id: int, baseline: dict) -> None:
     cached.std_q = baseline["std_q"]
     cached.slope_per_day = baseline["slope_per_day"]
     cached.n_samples = baseline["n_samples"]
-    cached.updated_at = datetime.now(timezone.utc)
+    cached.updated_at = datetime.now(UTC)
     db.commit()

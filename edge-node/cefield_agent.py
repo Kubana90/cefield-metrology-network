@@ -99,7 +99,7 @@ def main():
             
             if 'swarm_matches' in res_json:
                 for match in res_json['swarm_matches']:
-                    print(f"-> SWARM MATCH: {match['similarity_score']}% match with {match['matched_lab']}")
+                    print(f"-> SWARM MATCH: {match['similarity_pct']}% match with {match['lab']}")
                     
             print(f"\nClaude Diagnostic: {res_json.get('ai_diagnostic')}")
             print("-" * 50)

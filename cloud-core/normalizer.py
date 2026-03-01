@@ -15,22 +15,23 @@ Normalization pipeline per vector:
   3. ADC resolution norm (effective bits correction)
   4. L2 unit-vector norm (hardware-agnostic cosine basis)
 """
+
 from __future__ import annotations
 
 import numpy as np
 
 # Hardware calibration profiles — extend as new hardware types are onboarded
 HARDWARE_PROFILES: dict[str, dict] = {
-    "red_pitaya":       {"adc_bits": 14, "bandwidth_hz": 50e6,   "noise_floor_db": -120},
-    "red_pitaya_stem":  {"adc_bits": 14, "bandwidth_hz": 50e6,   "noise_floor_db": -120},
-    "pico_scope_6000":  {"adc_bits": 12, "bandwidth_hz": 200e6,  "noise_floor_db": -110},
-    "pico_scope_4000":  {"adc_bits": 12, "bandwidth_hz": 80e6,   "noise_floor_db": -112},
-    "keysight_dso":     {"adc_bits": 16, "bandwidth_hz": 6e9,    "noise_floor_db": -130},
-    "keysight_mso":     {"adc_bits": 16, "bandwidth_hz": 6e9,    "noise_floor_db": -130},
-    "rtl_sdr":          {"adc_bits": 8,  "bandwidth_hz": 3e6,    "noise_floor_db": -100},
-    "hackrf_one":       {"adc_bits": 8,  "bandwidth_hz": 20e6,   "noise_floor_db": -103},
-    "usrp_b200":        {"adc_bits": 12, "bandwidth_hz": 56e6,   "noise_floor_db": -115},
-    "generic_sdr":      {"adc_bits": 8,  "bandwidth_hz": 3e6,    "noise_floor_db": -100},
+    "red_pitaya": {"adc_bits": 14, "bandwidth_hz": 50e6, "noise_floor_db": -120},
+    "red_pitaya_stem": {"adc_bits": 14, "bandwidth_hz": 50e6, "noise_floor_db": -120},
+    "pico_scope_6000": {"adc_bits": 12, "bandwidth_hz": 200e6, "noise_floor_db": -110},
+    "pico_scope_4000": {"adc_bits": 12, "bandwidth_hz": 80e6, "noise_floor_db": -112},
+    "keysight_dso": {"adc_bits": 16, "bandwidth_hz": 6e9, "noise_floor_db": -130},
+    "keysight_mso": {"adc_bits": 16, "bandwidth_hz": 6e9, "noise_floor_db": -130},
+    "rtl_sdr": {"adc_bits": 8, "bandwidth_hz": 3e6, "noise_floor_db": -100},
+    "hackrf_one": {"adc_bits": 8, "bandwidth_hz": 20e6, "noise_floor_db": -103},
+    "usrp_b200": {"adc_bits": 12, "bandwidth_hz": 56e6, "noise_floor_db": -115},
+    "generic_sdr": {"adc_bits": 8, "bandwidth_hz": 3e6, "noise_floor_db": -100},
 }
 
 # Common reference class — all vectors are normalized to this basis

@@ -4,28 +4,36 @@ Unit tests for CEFIELD Baseline Engine, Prediction Engine, and Normalizer.
 All tests use mocked SQLAlchemy sessions — no database required.
 Run: pytest tests/ -v
 """
-import pytest
-import numpy as np
-from datetime import datetime, timezone, timedelta
+
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
 
 # conftest.py adds cloud-core to sys.path — imports work without qualification
 from baseline import (
-    compute_node_baseline,
-    predict_time_to_failure,
     CRITICAL_Q_FACTOR_DEFAULT,
     Z_SCORE_ALERT_THRESHOLD,
+    compute_node_baseline,
+    predict_time_to_failure,
 )
-from normalizer import normalize_vector, list_supported_hardware, HARDWARE_PROFILES
+from normalizer import HARDWARE_PROFILES, list_supported_hardware, normalize_vector
 
 
 # ─── Shared Helpers ──────────────────────────────────────────────────────────────────────
 def _make_meas(n: int, start_q: float, slope_per_sample: float = 0.0):
-    """Generate n mock measurement objects (newest first, descending in time)."""
-    now = datetime.now(timezone.utc)
+    """Generate n mock measurement objects (newest first, descending in time).
+
+    slope_per_sample is applied in chronological order: start_q is the oldest
+    value and each subsequent sample (going forward in time) shifts by
+    slope_per_sample.  Because the list is newest-first, index 0 holds the
+    most recent measurement: start_q + slope_per_sample * (n - 1).
+    """
+    now = datetime.now(UTC)
     return [
         MagicMock(
-            q_factor=start_q + slope_per_sample * i,
+            q_factor=start_q + slope_per_sample * (n - 1 - i),
             timestamp=now - timedelta(hours=i),
         )
         for i in range(n)
@@ -36,11 +44,7 @@ def _mock_db(measurements):
     """Create a mock SQLAlchemy Session that returns given measurements."""
     db = MagicMock()
     (
-        db.query.return_value
-        .filter.return_value
-        .order_by.return_value
-        .limit.return_value
-        .all.return_value
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value
     ) = measurements
     return db
 
@@ -65,8 +69,8 @@ class TestComputeNodeBaseline:
         assert abs(result["z_score_last"]) < 1.0
 
     def test_statistical_anomaly_detected_on_sudden_drop(self):
-        meas = _make_meas(50, 50_000)       # baseline ~50k
-        meas[0].q_factor = 3_000           # severe drop on latest measurement
+        meas = _make_meas(50, 50_000)  # baseline ~50k
+        meas[0].q_factor = 3_000  # severe drop on latest measurement
         result = compute_node_baseline(_mock_db(meas), node_id=1)
         assert result["is_statistical_anomaly"] is True
         assert result["z_score_last"] < -Z_SCORE_ALERT_THRESHOLD
@@ -93,8 +97,11 @@ class TestComputeNodeBaseline:
 class TestPredictTimeToFailure:
     def test_stable_device_returns_none(self):
         baseline = {
-            "status": "ok", "mean_q": 50_000,
-            "slope_per_day": 10.0, "n_samples": 50, "needs_warmup": False,
+            "status": "ok",
+            "mean_q": 50_000,
+            "slope_per_day": 10.0,
+            "n_samples": 50,
+            "needs_warmup": False,
         }
         assert predict_time_to_failure(baseline) is None
 
@@ -105,8 +112,11 @@ class TestPredictTimeToFailure:
     def test_degrading_device_predicts_correct_days(self):
         # mean=15000, slope=-200/day, threshold=5000 → (15000-5000)/200 = 50 days
         baseline = {
-            "status": "ok", "mean_q": 15_000.0,
-            "slope_per_day": -200.0, "n_samples": 60, "needs_warmup": False,
+            "status": "ok",
+            "mean_q": 15_000.0,
+            "slope_per_day": -200.0,
+            "n_samples": 60,
+            "needs_warmup": False,
         }
         result = predict_time_to_failure(baseline, critical_threshold=5_000)
         assert result is not None
@@ -116,8 +126,11 @@ class TestPredictTimeToFailure:
 
     def test_already_critical_returns_zero_days(self):
         baseline = {
-            "status": "ok", "mean_q": 2_000.0,
-            "slope_per_day": -100.0, "n_samples": 30, "needs_warmup": False,
+            "status": "ok",
+            "mean_q": 2_000.0,
+            "slope_per_day": -100.0,
+            "n_samples": 30,
+            "needs_warmup": False,
         }
         result = predict_time_to_failure(baseline, critical_threshold=5_000)
         assert result["days_to_failure"] == 0
@@ -125,8 +138,10 @@ class TestPredictTimeToFailure:
 
     def test_confidence_scales_with_sample_count(self):
         base = {
-            "status": "ok", "mean_q": 20_000.0,
-            "slope_per_day": -100.0, "needs_warmup": False,
+            "status": "ok",
+            "mean_q": 20_000.0,
+            "slope_per_day": -100.0,
+            "needs_warmup": False,
         }
         assert predict_time_to_failure({**base, "n_samples": 60})["confidence"] == "high"
         assert predict_time_to_failure({**base, "n_samples": 25})["confidence"] == "medium"
@@ -151,7 +166,9 @@ class TestNormalizeVector:
         vec = rng.standard_normal(128).tolist()
         v_rp = normalize_vector(vec, "red_pitaya")
         v_ks = normalize_vector(vec, "keysight_dso")
-        assert not np.allclose(v_rp, v_ks), "Different hardware should yield different normalization"
+        assert not np.allclose(v_rp, v_ks), (
+            "Different hardware should yield different normalization"
+        )
 
     def test_unknown_hardware_falls_back_gracefully(self):
         vec = [0.1] * 128

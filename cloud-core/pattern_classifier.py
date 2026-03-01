@@ -15,11 +15,13 @@ Pattern lifecycle:
 The precursor patterns are what enable:
   "This pattern was seen at 5 other labs — they all failed within 24h."
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
-from sqlalchemy.orm import Session
+
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from database import Measurement
 
@@ -36,9 +38,7 @@ def classify_precursor_patterns(
     Returns: total number of measurements reclassified.
     """
     failure_ts = (
-        db.query(Measurement.timestamp)
-        .filter(Measurement.id == failure_measurement_id)
-        .scalar()
+        db.query(Measurement.timestamp).filter(Measurement.id == failure_measurement_id).scalar()
     )
     if not failure_ts:
         return 0
@@ -71,9 +71,9 @@ def classify_precursor_patterns(
     )
 
     # Label the failure measurement itself
-    db.query(Measurement).filter(
-        Measurement.id == failure_measurement_id
-    ).update({"pattern_type": "failure"}, synchronize_session=False)
+    db.query(Measurement).filter(Measurement.id == failure_measurement_id).update(
+        {"pattern_type": "failure"}, synchronize_session=False
+    )
 
     db.commit()
     return n1 + n2
