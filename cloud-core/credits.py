@@ -120,11 +120,22 @@ def check_sufficient_credits(
     """
     Check if organization has enough credits for a debit action.
 
+    IMPORTANT: Earning actions (positive reward) ALWAYS return True —
+    they are never blocked by balance. Only debit actions (negative
+    reward) require a balance check.
+
     Returns:
         (has_sufficient, current_balance)
     """
-    cost = abs(CREDIT_REWARDS.get(action, 0))
+    reward = CREDIT_REWARDS.get(action, 0)
     balance = org.credit_balance or 0
+
+    # Earn / neutral actions are never blocked by balance
+    if reward >= 0:
+        return (True, balance)
+
+    # Debit action: check if balance covers the cost
+    cost = abs(reward)
     return (balance >= cost, balance)
 
 

@@ -32,6 +32,7 @@ from normalizer import normalize_vector, get_hardware_info, list_supported_hardw
 from pattern_classifier import classify_precursor_patterns, get_network_precursor_stats
 from credits import (
     CreditAction,
+    CREDIT_REWARDS,
     apply_credit,
     check_sufficient_credits,
     get_credit_balance,
@@ -64,6 +65,9 @@ app = FastAPI(
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY", "sk_test_mock")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_mock")
+# Admin key: set CEFIELD_ADMIN_KEY env var to enable secure cross-org credit grants
+# If not set, only enterprise-tier orgs can call /admin/grant (self-grant only)
+CEFIELD_ADMIN_KEY = os.environ.get("CEFIELD_ADMIN_KEY", "")
 
 if STRIPE_AVAILABLE and stripe:
     stripe.api_key = STRIPE_API_KEY
@@ -101,6 +105,24 @@ def get_organization_from_api_key(
     return org
 
 
+def _require_admin(request: Request) -> None:
+    """
+    Admin gate: pass if either
+      (a) CEFIELD_ADMIN_KEY is set and X-CEFIELD-ADMIN-KEY header matches, OR
+      (b) CEFIELD_ADMIN_KEY is not configured (dev mode, caller is enterprise).
+    Called explicitly in admin endpoints AFTER org is resolved.
+    """
+    if not CEFIELD_ADMIN_KEY:
+        # Dev / local mode — admin key not configured, skip header check
+        return
+    submitted = request.headers.get("X-CEFIELD-ADMIN-KEY", "")
+    if submitted != CEFIELD_ADMIN_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin key required: set X-CEFIELD-ADMIN-KEY header",
+        )
+
+
 # ─── Schemas ─────────────────────────────────────────────────────────────────────
 class ResonatorSignature(BaseModel):
     node_id: str
@@ -121,6 +143,10 @@ class CustomerCreate(BaseModel):
 class CreditGrantRequest(BaseModel):
     amount: int = Field(..., gt=0, description="Credits to grant")
     note: Optional[str] = None
+    target_org_id: Optional[int] = Field(
+        None,
+        description="Target org ID for cross-org grants (admin key required)",
+    )
 
 
 # ─── Precursor Search ────────────────────────────────────────────────────────────
@@ -305,22 +331,64 @@ async def credits_history(
 @app.post("/api/v1/credits/admin/grant")
 async def admin_grant_credits(
     data: CreditGrantRequest,
+    request: Request,
     org: Organization = Depends(get_organization_from_api_key),
     db: Session = Depends(get_db),
 ):
     """
-    Admin endpoint: manually grant credits to an organization.
-    Use for promotions, partnerships, or error corrections.
+    Grant credits to an organization.
+
+    Access rules:
+      - With X-CEFIELD-ADMIN-KEY header (matching CEFIELD_ADMIN_KEY env var):
+        Can grant to any org via target_org_id. Full admin access.
+      - Without admin key, enterprise tier only:
+        Can only grant to self (useful for reseller partner top-ups).
+      - Without admin key, freemium tier:
+        HTTP 403 — not permitted.
+
+    Set CEFIELD_ADMIN_KEY env var to enable admin key header validation.
+    If CEFIELD_ADMIN_KEY is not set (dev mode), admin key check is skipped.
     """
+    submitted_admin_key = request.headers.get("X-CEFIELD-ADMIN-KEY", "")
+    has_admin_key = CEFIELD_ADMIN_KEY and (submitted_admin_key == CEFIELD_ADMIN_KEY)
+    is_enterprise = org.subscription_tier == "enterprise"
+
+    if not has_admin_key and not is_enterprise and CEFIELD_ADMIN_KEY:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Admin grant requires X-CEFIELD-ADMIN-KEY header "
+                "or enterprise subscription tier."
+            ),
+        )
+
+    # Resolve target organization
+    target_org = org  # default: grant to requesting org
+    if data.target_org_id and data.target_org_id != org.id:
+        if not has_admin_key:
+            raise HTTPException(
+                status_code=403,
+                detail="X-CEFIELD-ADMIN-KEY required for cross-org credit grants.",
+            )
+        target_org = db.query(Organization).filter(
+            Organization.id == data.target_org_id
+        ).first()
+        if not target_org:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Organization {data.target_org_id} not found.",
+            )
+
     tx = apply_credit(
-        db, org, CreditAction.ADMIN_GRANT,
+        db, target_org, CreditAction.ADMIN_GRANT,
         amount_override=data.amount,
-        note=data.note or "Admin manual grant",
+        note=data.note or f"Admin grant by org:{org.id} ({org.name})",
     )
     db.commit()
     return {
-        "message": f"Granted {data.amount} credits to {org.name}",
-        "new_balance": org.credit_balance,
+        "message": f"Granted {data.amount} credits to {target_org.name}",
+        "target_org": target_org.name,
+        "new_balance": target_org.credit_balance,
         "transaction_id": tx.id,
     }
 
@@ -328,7 +396,6 @@ async def admin_grant_credits(
 @app.get("/api/v1/credits/pricing")
 async def credits_pricing():
     """Returns the current credit reward/cost table."""
-    from credits import CREDIT_REWARDS
     return {
         "pricing": {
             action.value: amount
@@ -365,7 +432,7 @@ async def onboard_customer(data: CustomerCreate, db: Session = Depends(get_db)):
         db.add(org)
         db.flush()
 
-        # Grant signup bonus via credit system
+        # Grant signup bonus via credit system (creates first ledger entry)
         apply_credit(
             db, org, CreditAction.SIGNUP_BONUS,
             note="Welcome to the CEFIELD network!",
@@ -469,7 +536,7 @@ async def ingest_signature(
     if baseline.get("needs_warmup") and signature.q_factor < CRITICAL_Q_FACTOR_DEFAULT:
         is_alert = True
 
-    # ── Credit: precursor search costs credits (skip for enterprise) ────────────
+    # ── Credit: precursor search costs credits (enterprise: unlimited) ──────────
     precursor_matches = []
     if is_alert:
         can_query, balance = check_sufficient_credits(org, CreditAction.QUERY_PRECURSOR)
@@ -500,7 +567,7 @@ async def ingest_signature(
     db.add(measurement)
     node.last_alert = is_alert
 
-    # ── Credit: reward for ingestion ─────────────────────────────────────────────
+    # ── Credit: reward for data contribution ──────────────────────────────────────
     credit_action = CreditAction.INGEST_ANOMALY if is_alert else CreditAction.INGEST_NORMAL
     apply_credit(
         db, org, credit_action,
@@ -519,7 +586,7 @@ async def ingest_signature(
         )
 
     if is_alert:
-        # ── Credit: AI diagnostic costs credits (enterprise unlimited) ───────────
+        # ── Credit: AI diagnostic costs credits (enterprise: unlimited) ────────
         ai_report = None
         can_ai, _ = check_sufficient_credits(org, CreditAction.AI_DIAGNOSTIC)
         if can_ai or org.subscription_tier == "enterprise":
@@ -664,6 +731,7 @@ def health():
         "version": "3.1.0",
         "stripe": STRIPE_AVAILABLE,
         "ai": ANTHROPIC_AVAILABLE,
+        "admin_protected": bool(CEFIELD_ADMIN_KEY),
         "features": [
             "statistical_baseline_engine",
             "predictive_time_to_failure",
